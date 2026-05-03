@@ -1,134 +1,547 @@
 import { execSync } from 'child_process';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
+import figlet from 'figlet';
+import inquirer from 'inquirer';
+import { createSpinner } from 'nanospinner';
 import { vivo } from './config/vivo.js';
 import { redmi } from './config/redmi.js';
 
-const args = process.argv;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const CONFIG_DIR = path.join(__dirname, 'config');
 
-const isVivo = args.includes('--vivo');
-const isRedmi = args.includes('--redmi')
-// ==================== CONFIGURATION ====================
-// Add the package names you want to manage here
-const APPS_TO_UNINSTALL = [
-  ...(isVivo ? vivo.uninstall : []),
-  ...(isRedmi ? redmi.uninstall : []),
-]
-const APPS_TO_DISABLE = [
-  ...(isVivo ? vivo.disable : []),
-  ...(isRedmi ? redmi.disable : [])
-]
-// ========================================================
+const BUILTIN_CONFIGS = {
+  vivo,
+  redmi
+};
 
-/**
- * Checks if ADB is installed and a device is properly connected and authorized.
- */
+function shellQuote(value) {
+  return `'${String(value)}'`;
+}
+
+function runCommand(command) {
+  return execSync(command, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe']
+  }).trim();
+}
+
 function checkAdbConnection() {
   try {
-    // 1. Check if adb command exists on the Linux system
-    execSync('which adb', { stdio: 'pipe' });
+    runCommand('adb version');
   } catch (error) {
-    console.error('❌ Error: ADB is not installed on this Linux system.');
-    console.error('👉 Run: sudo apt install android-tools-adb (or your distro equivalent)');
-    process.exit(1);
+    throw new Error('ADB is not installed or not available in PATH.');
   }
 
+  const devicesOutput = runCommand('adb devices');
+  const devices = devicesOutput
+    .split('\n')
+    .slice(1)
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  if (devices.length === 0) {
+    throw new Error('No Android device detected. Connect a device and enable USB debugging.');
+  }
+
+  const firstDevice = devices[0];
+
+  if (firstDevice.includes('unauthorized')) {
+    throw new Error('Device is unauthorized. Accept the USB debugging prompt on the phone.');
+  }
+
+  if (firstDevice.includes('offline')) {
+    throw new Error('Device is offline. Reconnect USB debugging and try again.');
+  }
+
+  return firstDevice.split(/\s+/)[0];
+}
+
+function getDeviceProperty(propertyName) {
   try {
-    // 2. Check connected devices
-    const devicesOutput = execSync('adb devices', { encoding: 'utf8' });
-    const lines = devicesOutput.trim().split('\n').slice(1); // Remove the header line
-
-    const devices = lines
-      .map(line => line.trim())
-      .filter(line => line.length > 0);
-
-    if (devices.length === 0) {
-      console.error('❌ Error: No Android device detected.');
-      console.error('👉 Please connect your phone via USB and enable USB Debugging.');
-      process.exit(1);
-    }
-
-    const firstDevice = devices[0];
-    if (firstDevice.includes('unauthorized')) {
-      console.error('❌ Error: Device is unauthorized.');
-      console.error('👉 Please check your phone screen and tap "Allow USB Debugging".');
-      process.exit(1);
-    }
-
-    if (firstDevice.includes('offline')) {
-      console.error('❌ Error: Device is offline. Try toggling USB Debugging off and on.');
-      process.exit(1);
-    }
-
-    console.log('✅ ADB connected and authorized successfully.\n');
-  } catch (error) {
-    console.error('❌ Error: Failed to communicate with ADB.', error.message);
-    process.exit(1);
+    return runCommand(`adb shell getprop ${shellQuote(propertyName)}`);
+  } catch {
+    return '';
   }
 }
 
-/**
- * Executes an ADB shell command and handles specific error cases.
- */
-function runAdbCommand(packageName, commandType, adbArgs) {
-  const command = `adb shell pm ${adbArgs} ${packageName}`;
+function detectDeviceName() {
+  const candidates = [
+    getDeviceProperty('ro.product.model'),
+    getDeviceProperty('ro.product.device'),
+    getDeviceProperty('ro.product.name')
+  ].filter(Boolean);
+
+  const rawName = candidates[0] || 'android-device';
+  return rawName.replace(/\s+/g, ' ').trim();
+}
+
+function sanitizeFileName(name) {
+  return String(name)
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'device';
+}
+
+function toIdentifier(name) {
+  const base = String(name)
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .replace(/^(\d)/, '_$1')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+  return base || 'deviceConfig';
+}
+
+function prettifyPackageName(packageName) {
+  const tail = packageName.split('.').filter(Boolean).pop() || packageName;
+  return tail
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, char => char.toUpperCase());
+}
+
+function listInstalledPackages() {
+  const output = runCommand('adb shell pm list packages');
+  return output
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => line.replace(/^package:/, ''))
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function sortPackages(packages, sortOrder) {
+  const direction = sortOrder === 'desc' ? -1 : 1;
+  const sorted = [...packages].sort((a, b) => {
+    const leftRank = getPackageRank(a);
+    const rightRank = getPackageRank(b);
+
+    if (leftRank !== rightRank) {
+      return leftRank - rightRank;
+    }
+
+    const leftSubRank = getPackageSubRank(a);
+    const rightSubRank = getPackageSubRank(b);
+
+    if (leftSubRank !== rightSubRank) {
+      return leftSubRank - rightSubRank;
+    }
+
+    return a.localeCompare(b) * direction;
+  });
+ 
+  return sorted;
+}
+
+function getPackageRank(packageName) {
+  if (packageName.startsWith('com.')) {
+    return 0;
+  }
+
+  if (packageName === 'org.videolan.vlc') {
+    return 1;
+  }
+
+  return 2;
+}
+
+function getPackageSubRank(packageName) {
+  if (packageName === 'com.whatsapp') {
+    return 0;
+  }
+
+  if (packageName === 'org.videolan.vlc') {
+    return 0;
+  }
+
+  return 1;
+}
+
+function filterPackages(packages, searchTerm) {
+  const query = searchTerm.trim().toLowerCase();
+
+  if (!query) {
+    return packages;
+  }
+
+  return packages.filter(pkg => {
+    const label = prettifyPackageName(pkg).toLowerCase();
+    return pkg.toLowerCase().includes(query) || label.includes(query);
+  });
+}
+
+function extractLabel(dumpsysOutput, packageName) {
+  const labelMatch = dumpsysOutput.match(/application-label(?:-[^:]+)?:'([^']+)'/i);
+  if (labelMatch?.[1]) {
+    return labelMatch[1].trim();
+  }
+
+  const fallbackMatch = dumpsysOutput.match(/application-label(?:-[^:]+)?:\s*([^\n\r]+)/i);
+  if (fallbackMatch?.[1]) {
+    return fallbackMatch[1].trim().replace(/^"|"$/g, '');
+  }
+
+  return prettifyPackageName(packageName);
+}
+
+function extractActivity(resolveOutput) {
+  const lines = resolveOutput
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    if (line.includes('/')) {
+      const resolved = line.split('/').slice(1).join('/').trim();
+      if (resolved && !resolved.toLowerCase().includes('no activity')) {
+        return resolved;
+      }
+    }
+  }
+
+  const lastLine = lines.at(-1) || '';
+  if (lastLine && !lastLine.toLowerCase().includes('no activity')) {
+    return lastLine.includes('/') ? lastLine.split('/').at(-1).trim() : lastLine;
+  }
+
+  return null;
+}
+
+function resolveSelectedApp(packageName) {
+  let label = prettifyPackageName(packageName);
+  let activity = null;
 
   try {
-    const stdout = execSync(command, { encoding: 'utf8', stdio: 'pipe' }).trim();
+    const dumpsysOutput = runCommand(`adb shell dumpsys package ${shellQuote(packageName)}`);
+    label = extractLabel(dumpsysOutput, packageName);
+  } catch {
+    label = prettifyPackageName(packageName);
+  }
 
-    // Check for silent or non-throwing failures that return specific text
-    if (stdout.toLowerCase().includes('failure') || stdout.toLowerCase().includes('error')) {
+  try {
+    const resolveOutput = runCommand(`adb shell cmd package resolve-activity --brief ${shellQuote(packageName)}`);
+    activity = extractActivity(resolveOutput);
+  } catch {
+    activity = null;
+  }
+
+  return {
+    name: label,
+    package: packageName,
+    activity
+  };
+}
+
+function normalizeAppList(apps) {
+  return apps
+    .filter(Boolean)
+    .map(app => ({
+      name: app.name || prettifyPackageName(app.package || ''),
+      package: app.package,
+      activity: app.activity ?? null
+    }))
+    .filter(app => app.package);
+}
+
+function normalizeConfig(config) {
+  const uninstall = normalizeAppList(config?.uninstall ?? []);
+  const uninstallPackages = new Set(uninstall.map(app => app.package));
+  const disable = normalizeAppList(config?.disable ?? []).filter(app => !uninstallPackages.has(app.package));
+
+  return {
+    deviceName: config?.deviceName ?? null,
+    uninstall,
+    disable
+  };
+}
+
+function formatConfigModule(exportName, config) {
+  return [
+    `export const ${exportName} = ${JSON.stringify(config, null, 2)};`,
+    '',
+    `export default ${exportName};`,
+    ''
+  ].join('\n');
+}
+
+async function saveConfigFile(deviceName, config) {
+  await fs.mkdir(CONFIG_DIR, { recursive: true });
+
+  const fileBase = sanitizeFileName(deviceName);
+  const exportName = toIdentifier(fileBase);
+  const filePath = path.join(CONFIG_DIR, `${fileBase}.js`);
+  const payload = {
+    deviceName,
+    ...config
+  };
+
+  await fs.writeFile(filePath, formatConfigModule(exportName, payload), 'utf8');
+  return filePath;
+}
+
+async function loadConfigFromFile(configPath) {
+  const resolvedPath = path.resolve(process.cwd(), configPath);
+  const moduleUrl = pathToFileURL(resolvedPath).href;
+  const module = await import(moduleUrl);
+
+  return normalizeConfig(module.default ?? module.config ?? module.vivo ?? module.redmi ?? module);
+}
+
+function printBanner() {
+  console.log(figlet.textSync('DEBLOAT', {
+    horizontalLayout: 'default',
+    verticalLayout: 'default'
+  }));
+  console.log('ADB debloat CLI with package discovery, config generation, and execution.\n');
+}
+
+async function askForPackages(packages) {
+  const { searchTerm, sortOrder } = await inquirer.prompt([
+    {
+      type: 'input',
+      name: 'searchTerm',
+      message: 'Search packages by app name or package id',
+      default: ''
+    },
+    {
+      type: 'list',
+      name: 'sortOrder',
+      message: 'Sort packages',
+      choices: [
+        { name: 'A to Z', value: 'asc' },
+        { name: 'Z to A', value: 'desc' }
+      ],
+      default: 'asc'
+    }
+  ]);
+
+  const filteredPackages = sortPackages(filterPackages(packages, searchTerm), sortOrder);
+
+  if (filteredPackages.length === 0) {
+    console.log('No packages matched your search.');
+    return [];
+  }
+
+  const { selectedPackages } = await inquirer.prompt([
+    {
+      type: 'checkbox',
+      name: 'selectedPackages',
+      message: 'Select packages to inspect and manage',
+      choices: filteredPackages.map(pkg => ({
+        name: pkg,
+        value: pkg
+      })),
+      pageSize: 20
+    }
+  ]);
+
+  return selectedPackages;
+}
+
+async function askForAction(apps, actionName) {
+  if (apps.length === 0) {
+    return [];
+  }
+
+  const { selected } = await inquirer.prompt([
+    {
+      type: 'checkbox',
+      name: 'selected',
+      message: `Which of these should be marked for ${actionName}?`,
+      choices: apps.map(app => ({
+        name: `${app.package}${app.activity ? ` | ${app.activity}` : ''}`,
+        value: app.package
+      })),
+      pageSize: 20
+    }
+  ]);
+
+  return apps.filter(app => selected.includes(app.package));
+}
+
+function runAdbAction(app, actionType, adbArgs) {
+  const command = `adb shell pm ${adbArgs} ${shellQuote(app.package)}`;
+
+  try {
+    const stdout = runCommand(command);
+    if (/failure|error/i.test(stdout)) {
       throw new Error(stdout);
     }
 
-    console.log(`  └─ [SUCCESS] ${commandType}: ${packageName}`);
+    console.log(`  ✓ ${actionType}: ${app.name} (${app.package})`);
   } catch (error) {
-    const errorMsg = error.stderr || error.message || '';
+    const message = String(error?.stderr || error?.message || error || '').trim();
+    console.log(`  ✗ ${actionType}: ${app.name} (${app.package})`);
 
-    console.log(`  └─ [FAILED] ${commandType}: ${packageName}`);
+    if (/not installed for 0|Unknown package/i.test(message)) {
+      console.warn('    App is already removed or does not exist for this user.');
+      return;
+    }
 
-    // Categorize specific ADB errors
-    if (errorMsg.includes('not installed for 0') || errorMsg.includes('Unknown package')) {
-      console.warn(`     ⚠️  Reason: App is already uninstalled or does not exist.`);
-    } else if (errorMsg.includes('Permission denied') || errorMsg.includes('SecurityException')) {
-      console.warn(`     ⚠️  Reason: Permission issue. The system prevents removing/disabling this protected app.`);
-    } else {
-      console.warn(`     ⚠️  Reason: ${errorMsg.replace(/\n/g, ' ').trim()}`);
+    if (/Permission denied|SecurityException/i.test(message)) {
+      console.warn('    The device blocked this protected package.');
+      return;
+    }
+
+    console.warn(`    ${message || 'Unknown ADB failure.'}`);
+  }
+}
+
+function executeConfig(config) {
+  const normalized = normalizeConfig(config);
+
+  if (normalized.uninstall.length === 0 && normalized.disable.length === 0) {
+    console.log('Nothing to process.');
+    return;
+  }
+
+  if (normalized.uninstall.length > 0) {
+    const spinner = createSpinner(`Uninstalling ${normalized.uninstall.length} package(s)`).start();
+    normalized.uninstall.forEach(app => runAdbAction(app, 'UNINSTALL', 'uninstall -k --user 0'));
+    spinner.success({ text: 'Uninstall phase complete' });
+  }
+
+  if (normalized.disable.length > 0) {
+    const spinner = createSpinner(`Disabling ${normalized.disable.length} package(s)`).start();
+    normalized.disable.forEach(app => runAdbAction(app, 'DISABLE', 'disable-user --user 0'));
+    spinner.success({ text: 'Disable phase complete' });
+  }
+}
+
+async function interactiveFlow() {
+  printBanner();
+
+  const deviceSpinner = createSpinner('Checking ADB connection').start();
+  const serial = checkAdbConnection();
+  const deviceName = detectDeviceName();
+  deviceSpinner.success({ text: `Connected to ${deviceName} (${serial})` });
+
+  const packagesSpinner = createSpinner('Listing installed packages').start();
+  const packages = listInstalledPackages();
+  packagesSpinner.success({ text: `Found ${packages.length} packages` });
+
+  if (packages.length === 0) {
+    console.log('No packages were found on the connected device.');
+    return;
+  }
+
+  const selectedPackages = await askForPackages(packages);
+
+  if (selectedPackages.length === 0) {
+    console.log('No packages selected. Exiting.');
+    return;
+  }
+
+  const detailsSpinner = createSpinner('Resolving app names and activities').start();
+  const selectedApps = selectedPackages.map(resolveSelectedApp);
+  detailsSpinner.success({ text: 'Resolved selected apps' });
+
+  const uninstallApps = await askForAction(selectedApps, 'uninstall');
+  const disableApps = await askForAction(selectedApps, 'disable');
+
+  const config = normalizeConfig({
+    deviceName,
+    uninstall: uninstallApps,
+    disable: disableApps
+  });
+
+  if (config.uninstall.length === 0 && config.disable.length === 0) {
+    console.log('No actions were selected. Exiting.');
+    return;
+  }
+
+  const saveSpinner = createSpinner(`Saving config/${sanitizeFileName(deviceName)}.js`).start();
+  const configPath = await saveConfigFile(deviceName, config);
+  saveSpinner.success({ text: `Saved ${path.relative(process.cwd(), configPath)}` });
+
+  console.log('\nPreview');
+  console.log('-------');
+  console.log(JSON.stringify(config, null, 2));
+  console.log('');
+
+  executeConfig(config);
+}
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  const result = {
+    configPath: null,
+    preset: null
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (arg === '--config' || arg === '-c') {
+      result.configPath = args[index + 1] ?? null;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--vivo') {
+      result.preset = 'vivo';
+    }
+
+    if (arg === '--redmi') {
+      result.preset = 'redmi';
     }
   }
+
+  return result;
 }
 
-// ==================== MAIN EXECUTION ====================
+export {
+  checkAdbConnection,
+  executeConfig,
+  interactiveFlow,
+  loadConfigFromFile,
+  normalizeConfig,
+  resolveSelectedApp,
+  saveConfigFile
+};
 
-function main() {
-  console.log('===================================================');
-  console.log('📱 Starting Debloat Automation 📱');
-  console.log('===================================================\n');
+async function main() {
+  const { configPath, preset } = parseArgs(process.argv);
 
-  // Step 1: Pre-flight checks
-  checkAdbConnection();
+  if (configPath) {
+    printBanner();
+    const deviceSpinner = createSpinner('Checking ADB connection').start();
+    const serial = checkAdbConnection();
+    const deviceName = detectDeviceName();
+    deviceSpinner.success({ text: `Connected to ${deviceName} (${serial})` });
 
-  // Step 2: Handle uninstalls
-  if (APPS_TO_UNINSTALL.length > 0) {
-    console.log(`🧹 Processing Uninstall List (${APPS_TO_UNINSTALL.length} apps)...`);
-    APPS_TO_UNINSTALL.forEach(pkg => {
-      console.log(pkg.name)
-      runAdbCommand(pkg.package, 'UNINSTALL', 'uninstall -k --user 0');
-    });
-    console.log('');
+    const loadSpinner = createSpinner(`Loading ${configPath}`).start();
+    const config = await loadConfigFromFile(configPath);
+    loadSpinner.success({ text: `Loaded ${configPath}` });
+    executeConfig(config);
+    return;
   }
 
-  // Step 3: Handle disables
-  if (APPS_TO_DISABLE.length > 0) {
-    console.log(`🔒 Processing Disable List (${APPS_TO_DISABLE.length} apps)...`);
-    APPS_TO_DISABLE.forEach(pkg => {
-      console.log(pkg.name)
-      runAdbCommand(pkg.name, 'DISABLE', 'disable-user --user 0');
-    });
-    console.log('');
+  if (preset && BUILTIN_CONFIGS[preset]) {
+    printBanner();
+    const deviceSpinner = createSpinner('Checking ADB connection').start();
+    const serial = checkAdbConnection();
+    const deviceName = detectDeviceName();
+    deviceSpinner.success({ text: `Connected to ${deviceName} (${serial})` });
+
+    executeConfig(BUILTIN_CONFIGS[preset]);
+    return;
   }
 
-  console.log('===================================================');
-  console.log('🎉 Clean-up execution completed.');
-  console.log('===================================================');
+  await interactiveFlow();
 }
 
-main();
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === __filename;
+
+if (isDirectRun) {
+  main().catch(error => {
+    console.error('\nFatal error:', error.message || error);
+    process.exit(1);
+  });
+}

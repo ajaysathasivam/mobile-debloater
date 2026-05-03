@@ -8,6 +8,11 @@
     "start": "node debloat.js",
     "debloat": "node debloat.js"
   },
+  "dependencies": {
+    "figlet": "^1.8.0",
+    "inquirer": "^12.0.0",
+    "nanospinner": "^1.1.0"
+  },
   "keywords": [
     "adb",
     "android",
